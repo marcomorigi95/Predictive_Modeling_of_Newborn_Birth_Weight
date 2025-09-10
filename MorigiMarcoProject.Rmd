@@ -1,0 +1,994 @@
+---
+title: "Predictive Modeling of Newborn Birth Weight"
+author: "Marco Morigi"
+date: "2024-03-14"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r libraries, message=FALSE, warning=FALSE, include=FALSE}
+library(rmarkdown)
+library(dplyr)
+library(pastecs)
+library(ggplot2)
+library(ggpubr)
+library(hrbrthemes)
+library(CUB)
+library(moments)
+library(scales)
+library(lubridate)
+library(geomtextpath)
+library(correlation)
+library(scales)
+library(tidyverse)
+library(patchwork)
+library(summarytools)
+library(car)   
+library(Hmisc)
+library(GGally)
+library(forcats)
+library(performance)
+library(see)
+library(MASS)
+library(lmtest)
+library(ggstatsplot)
+library(corrplot)
+library(plotly)
+library(visreg)
+library(olsrr)
+library(nortest)
+library(gt)
+library(parameters)
+library(ggfortify)
+library(marginaleffects)
+library(dvmisc)
+library(Metrics)
+library(lares)
+library(caret)
+```
+
+# Premises
+
+```{r Translate and update file, eval=FALSE, include=FALSE}
+data <- read.csv("neonati.csv",sep = ",")
+
+
+names(data) <- c("Mother.age","N.pregnancies","Smokers",
+                  "Gestation","Weight","Height","Cranium",
+                  "Birth.type","Hospital","Sex")
+
+write.table(data, "neonati.csv", sep = ",")
+```
+
+## Premises on data independence
+
+We assume the independence of the data.
+The data were collected from 3 hospitals, which does not imply that the data come exclusively from those 3 hospitals, it could also be 3 hospitals from 3 different countries that collected data at a national level, but we don't know if they come from the same city or from different countries. As we could be in the situation of measuring a particular "cluster", the various data could be influenced by phenomena such as pollution, wars, etc. Since we have no information about this, some precautions will be taken when we draw conclusions.
+
+# Part 1
+## 1) Import dataset
+
+```{r Import dataset, message=FALSE, warning=FALSE}
+data <- read.csv("neonati.csv",sep = ",")
+
+options(digits = 3,scipen=100) #global round
+
+#covert 0 and 1 to Non smoker and smoker for readability
+data$Smokers <- as.character(data$Smokers) 
+
+data$Smokers <- fct_recode(data$Smokers,
+                     "No" = "0",
+                     "Yes" = "1")
+
+```
+
+## 2) Dataset description
+
+Note that for the variable Mother's age there are two incorrect values for the age of 0 and 1, thus incorrect values will be replaced with the median age of the mothers.
+The next smallest values are 13 (years); given the fertile period begins after the first menstruation (normally between 12 and 14 years), they are accepted as plausible values.
+
+```{r Mothers age fixed, message=FALSE, warning=FALSE}
+
+data$Mother.age[data$Mother.age < 10] <- median(data$Mother.age)
+
+attach(data)
+
+```
+
+The are possible duplicate data entries. It might be that the same record has been entered 2 times by mistake: once it has been inserted for the first time, it is inserted again without deleting the previously inserted record. This can be noted because in these data entries, only a single field is different. Since the dataset is not very large, we are going to look for the records that have 9 out of 10 fields in common (this threshold was chosen by me).
+These are all the potential values entered incorrectly.
+
+```{r Same rows finder, eval=FALSE, include=FALSE}
+
+#code generated with profession ai, but it's very slow took >20minutes to search for every possible similarities, maybe in future i'll search for some package or function that are more efficient
+
+trova_valori_uguali <- function(dataset) {
+    risultati <- data.frame(riga1 = integer(), riga2 = integer())
+    
+    for (i in 1:nrow(dataset)) {
+      for (j in (i + 1):nrow(dataset)) {
+        riga1 <- dataset[i, ]
+        riga2 <- dataset[j, ]
+        
+        if (!anyNA(riga1) && !anyNA(riga2) && sum(riga1 == riga2, na.rm = TRUE) > 8) {
+          risultati <- rbind(risultati, data.frame(riga1 = i, riga2 = j))
+        }
+      }
+    }
+    
+    return(risultati)
+}
+
+risultati1 <- trova_valori_uguali(data)
+
+```
+
+
+```{r Possible duplicate rows}
+
+possible_dupli<-data[c(177,1645,2479,2484,2331,1849,2071,1542,935,862,1009,832,1322,519,1019,1578),]
+
+print_html(possible_dupli)
+```
+
+Let's analyze the data in pairs. In many cases, we notice that data collected by the same hospital present data that are too similar to be due purely to chance (we do not exclude it). The data are approximated to integers (so small differences can appear similar), and a unique identification code associated with the mother or the date of birth of the newborn are not available. Since we don't have enough information and due to the nature of the study, we opted to leave them as valid values, because we also do not exclude the option of twin births.
+
+There are also mothers in their 10th, 12th, 13th pregnancy, values that are a bit suspicious, but congruent with their age. For example, there are no 23 year old mothers with 13 pregnancies: this would certainly have been a mistake. Mothers with a high number of sustained pregnancies are always older than 30. So we don't have enough information to consider them invalid.
+
+
+### Type of variables
+
+Mother.age: Continuous quantitative on a ratio scale\
+N.pregnancies: Discrete quantitative on a ratio scale\
+Smokers: Dichotomous (Nominal)\
+Gestation: Continuous quantitative on a ratio scale\
+Weight: Continuous quantitative on a ratio scale\
+Height: Continuous quantitative on a ratio scale\
+Cranium: Continuous quantitative on a ratio scale\
+Birth.type: Dichotomous (Nominal)\
+Hospital: Nominal qualitative\
+Sex: Dichotomous (Nominal)
+
+### Goal to reach:
+
+The goal of this analysis is to explore the data to try to find a model, i.e. the set of predictors that help us explain a newborn's weight at birth, and if some of them are influential.\
+We will analyze whether there are significant differences between the sexes, the birth types and the fact that the mother is a smoker, and the possible interactions between the variables just mentioned.
+
+## 3) Descriptive analysis
+
+```{r Data summary,results="asis"}
+
+st_options(
+  plain.ascii = FALSE, 
+  dfSummary.style = "grid",
+  dfSummary.valid.col = FALSE,
+  dfSummary.graph.magnif = .5,
+  tmp.img.dir = "/tmp"
+)
+
+dfSummary(data)
+```
+
+We note that there is a 4.2% of smoking mothers during pregnancy. This percentage is slightly below the world average: according to WHO data, it's around 7-10%.
+
+The median gestation period, weight, height and cranium size of the newborns are in line with data provided by WHO. We use the median because from a first glance at the histograms it is noticeable a negative skewness, which could indicate the presence of outliers (more detailed considerations will be made later).
+
+As regards the type of birth, we have 29.1% of cesarean sections and 70.9% of natural births. These percentages are also in line with the average percentages provided by WHO.
+
+These samples are provided by 3 hospitals in almost equal quantities, and the total percentage of males and females tends to be almost the same as well.
+
+As regards the age of the mothers, the average is around 28, but this also takes into consideration mothers who had more than one child. As for the average age of birth for the first child, we have:
+
+```{r Mean and median mother age by N.pregnancies }
+
+data %>% 
+  reframe("Average age at first pregnancy"= mean(Mother.age[N.pregnancies==0]))
+
+```
+
+The average age at first birth is around 26, while globally it is around 28 (WHO data). 
+
+We note from the summary histogram above that the majority of mothers has 1 or 2 children, in line with the countries of the rest of the world with the exception of the countries of North Africa and the Middle East and those of sub-Saharan Africa. It is important to highlight that the average age of the mother at first birth can vary also within different sub populations of the same country, depending on cultural, economic and social factors.
+
+When we explored further, we noticed cases where mothers aged between 14 and 17 had their second child. Even if the possibility can not be excluded, the values could be incorrect.
+
+```{r minor with more than one pregnancy}
+
+data %>% 
+    filter((Mother.age<18 & N.pregnancies>0)) %>% 
+    reframe("Minor with more than one pregnancy"=n())
+```
+
+However, not knowing which country the data come from, we accept them as correct values, keeping this in mind when we make considerations.
+
+Let's see how strong is the skewness:
+
+```{r Skewness}
+stat.desc(data[,c(1,4:7)],norm = T)["skewness",]
+```
+
+The data are distorted in a negative sense, therefore with a long left tail, this is also hypothesized from the previous histograms.
+
+```{r Kurtosis}
+stat.desc(data[,c(1,4:7)],norm = T)["kurtosis",]
+```
+
+A first look at the kurtosis coefficient shows a strong trend to a positive excess kurtosis. Leptokurtic distributions are fat-tailed, meaning that they have many outliers.
+
+
+## 4)Average weight and height equal to literature
+
+With the data we have available, we can significantly generalize them to a general context, that is, can it be stated that the average weight and height of this sample of newborns are significantly equal to those of the population?
+
+Now we check if two variables are distributed according to a normal distribution (this allows us to understand what tests we should adopt in the future).
+
+```{r Check normality for weight and height, fig.width=10}
+
+qqplot_weight<-
+  ggplot(data = data,
+        aes(sample = Weight))+
+    geom_qq(pch=21) + stat_qq_line(col="blue")+
+    labs(title = "QQplot for Weight",y="Weight",x="Norm quantiles")+theme_bw()
+
+qqplot_height<-
+  ggplot(data = data,
+         aes(sample = Height))+
+    geom_qq(pch=21) + stat_qq_line(col="blue")+
+    labs(title = "QQplot for Height",y="Height",x="Norm quantiles")+theme_bw()
+
+qqplot_weight+qqplot_height
+```
+There is quite a noticeable deviation from normality. BUT QQplots are often difficult to interpret because they can be affected by outliers and it is unclear how large the deviation from the theoretical distribution must be to indicate a lack of fit.
+To confirm this deviation we use Anderson-Darling normality test. We use this test instead of the classic Shapiro-Wilk test because Shapiro-Wilk test is highly sensitive to small deviations from normality in large samples. We used Anderson-Darling test since it is a more robust test for large sample and can deal with a deviation in the tails.
+
+
+```{r Anderson-Darling normality test}
+
+data %>% 
+  reframe("P-value Weight"=ad.test(Weight)[["p.value"]],
+          "P-value Height"=ad.test(Height)[["p.value"]])
+
+```
+
+Both the QQplot and the Anderson-Darling test variables alone reject normality.
+Dividing by sex, the results are:
+
+```{r Check normality for weight by sex, fig.height=5, fig.width=10}
+ 
+qqplot_weight_sex<- 
+  ggplot(data = data,
+         aes(sample = Weight,color=Sex))+
+    geom_qq(pch=21) + stat_qq_line(col="blue")+
+    facet_wrap(~Sex)+
+    labs(title = "QQplot for Weight by Sex",y="Weight",x="Norm quantiles")+theme_bw()
+
+qqplot_height_sex<-
+  ggplot(data = data,
+         aes(sample = Height,color=Sex))+
+    geom_qq(pch=21) + stat_qq_line(col="blue")+
+    facet_wrap(~Sex)+
+    labs(title = "QQplot for Height by Sex",y="Height",x="Norm quantiles")+theme_bw()
+
+qqplot_weight_sex+qqplot_height_sex
+
+```
+
+```{r Anderson-Darling normality test by Sex}
+
+data %>% 
+  group_by(Sex) %>% 
+   reframe("P-value Weight"=ad.test(Weight)[["p.value"]],
+           "P-value Height"=ad.test(Height)[["p.value"]])
+```
+The same conclusions of non-normality can be drawn also from the division by sex.
+
+Given that both variables present a strong presence of outliars, which leads to a negative asymmetry and a deviation from the normal, to test wether it differs from literature we opt to apply more robust and therefore non-parametric tests i.e. the Wilcoxon test (also known as Mann-Whitney test).
+
+As reference values, in literature we have that males weigh around 3400g and are around 500mm tall, while females weigh around 3200g and are around 490mm tall. For the test we will use the central values between the two sexes, therefore 3300g for the weight and 495mm for the height.
+
+```{r Mann-Whitney test weight}
+
+wilcox.test(Weight,mu=3300,conf.int = TRUE) 
+```
+
+```{r Mann-Whitney test height}
+wilcox.test(Height,mu=495,conf.int = TRUE) 
+
+```
+
+Let's analyse the results. The weight coincides with the weight in literature, while, on the other hand, the p-value suggest to reject the hypothesis of no difference for the height. But, interestingly, the hypothesized value of 495 is included in the confidence interval. So maybe this is due to minor discrepancy in the data. 
+To understand better this, let's do the test again, but this time we take into consideration the sex (using as reference values the central values we saw before).  
+
+
+```{r Mann-Whitney test Weight male}
+
+wilcox.test(Weight[Sex=="M"],mu=3400,conf.int = TRUE) #equivalent to the Mann-Whitney
+```
+
+There appears to be a "significant" difference compared to the population, even if it is very small. While as for the female, how does it change?
+
+```{r Mann-Whitney test Weight female}
+wilcox.test(Weight[Sex=="F"],mu=3200,conf.int = TRUE)
+```
+
+Here too there seems to be a "significant" difference compared to the population. As for males, there seems to be an overestimation, while for females there seems to be an underestimation. 
+
+This could be due to these factors:
+
+```{r Column Proportions for overweight newborn}
+ctable(
+  x = Weight>=4000,
+  y = Sex ,
+  prop = "c")
+
+```
+
+We note that in the TRUE row, which indicates newborns whose weight exceeds 4000g (considered overweight), the percentage is almost twice for males compared to females. 
+
+While for the underweight we observe that:
+
+```{r Column Proportions for underweight newborn}
+ctable(
+  x = Weight<=2500,
+  y = Sex ,
+  prop = "c")
+```
+
+In the TRUE row, we observe the opposite effect compared to the previous table: the cases of underweight is almost twice for females compared to males (underweight is considered to be that regardless of the gestational period when the weight is less than 2500g). 
+
+For the males' height we note that:
+
+```{r Mann-Whitney test Height male}
+wilcox.test(Height[Sex=="M"],mu=500,conf.int = TRUE)
+```
+
+In this situation there is no significant difference between sample and population.
+
+For the females' height we note that:
+
+```{r Mann-Whitney test Height female}
+wilcox.test(Height[Sex=="F"],mu=490,conf.int = TRUE)
+```
+In this situation there is a "significant" difference between sample and population. Again, we reject the hypothesis for a little difference. What are the reason for that?
+
+Note how the gestational period changes between the sexes. There seems to be a greater frequency of premature births in females.
+
+```{r Column Proportions pretermal birth}
+
+ctable(
+  x = Gestation<38,
+  y = Sex ,
+  prop = "c")
+```
+
+Let's look at the TRUE row (premature births). There is a high percentage of total premature births, 14.2% (we consider premature births until the 37th week). WHO data reports an average of 7.3% in Europe and 10.4% in the USA. So this could be the cause that leads us to have a slightly high negative skewness.
+Females have more premature birth (17.4%) than males (10.9%), and this confirms what we had already noticed from test taken previously i.e. smaller height and weight for females compared to the female population. More considerations will be made later.
+
+After observing all the results, p-values suggest that there is a significant difference in most cases. It is important to note that a non-significant statistical test result does not necessarily mean that there is no difference between the sample and the population.
+Statistical tests cannot provide an absolute guarantee that there is no real difference between the sample and the population. A statistical test may not be significant due to a variety of factors, such as sample size, data variability (as we noted), confounding effects, or sampling errors.
+Thus the current data are not sufficient to confidently state that there is a significant difference between the sample and the population. It may simply indicates that the data collected are not robust enough to detect this difference.
+
+Thus after all this consideration, this sample doesn't differ too much from the population, albeit with some reservations.
+
+
+## 5) Differences between the sexes
+
+Let's analyze in detail whether it makes sense checking if there are significant differences between the sexes, both graphically and analytically.
+
+```{r Box plot of Weight by Sex, fig.width=10, message=FALSE}
+ggbetweenstats( 
+      data = data,
+      x = Sex,
+      y = Weight,
+      type = "nonparametric",# for wilcoxon test
+      )+
+  labs(title = "Distribution of Weight by Sex")+
+  ggplot2::scale_color_manual(values = c("#F8766D","#619CFF"))
+```
+
+
+
+As we can see from the median values, from the shape of the curves and from the p-values obtained using the non-parametric Mann-Whitney test, there is a significant difference between the two sexes, as we expected.
+
+```{r Box plot of Height by Sex, fig.width=10, message=FALSE}
+ggbetweenstats( 
+      data = data,
+      x = Sex,
+      y = Height,
+      type = "nonparametric"# for wilcoxon
+  )+
+    labs(title = "Distribution of Height by Sex")+
+    ggplot2::scale_color_manual(values = c("#F8766D","#619CFF"))
+```
+Same conclusions for the height. Even in literature we expect these differences.
+
+```{r Box plot of Cranium by Sex, fig.width=10, message=FALSE}
+ggbetweenstats( 
+      data = data,
+      x = Sex,
+      y = Cranium,
+      type = "nonparametric"# for wilcoxon
+  )+
+  labs(title = "Distribution of Cranium by Sex")+
+  ggplot2::scale_color_manual(values = c("#F8766D","#619CFF"))
+```
+We also draw the same conclusions for the diameter of the cranium. Even in literature we expect these differences.
+
+
+```{r Box plot of Gestation by Sex, fig.width=10, message=FALSE}
+ggbetweenstats( 
+      data = data,
+      x = Sex,
+      y = Gestation,
+      type = "nonparametric"# for wilcoxon
+  )+
+  labs(title = "Distribution of Gestation by Sex")+
+  ggplot2::scale_color_manual(values = c("#F8766D","#619CFF"))
+```
+In literature, there seems to be a minimal difference (few days) depending on the sex of the newborn. Males tend to be born later. As previously suspected, in our sample there is a significant difference also due to the fact that more premature births were recorded in females. 
+In conclusion, for this sample, both from an analytic and a graphical analysis, there are significant differences in the sexes for the examined variables.
+
+
+## 6) Hospitals
+
+Is it possible to establish whether there is an association between a certain hospital and cesarean sections?
+Will knowing in advance that a cesarean birth was carried out tell us in which hospital it was carried out? 
+
+Let's check this hypothesis.
+
+```{r Stacked bar charts for Hospistal with statistical tests}
+
+ggbarstats(data = data,
+           x = Birth.type,
+           y = Hospital,
+           perc.k=2)+
+  labs(title="Percentage of birth type by hospital",caption = NULL)
+  
+```
+
+By observing the p-value obtained, there is not sufficient evidence to establish that there is a relationship between hospitals and cesarean sections performed in the sample examined. Therefore, knowing the value of one variable doesn't help to predict the value of the other variable.
+
+
+# Part 2 
+## 1) Relationship between the variables
+
+Now we want to investigate any relationship between the variables, and with focus on the variable weight, we will look for those variables that are correlated with the weight the most, because these will help us creating a better prediction model.
+We analyze not only the correlation with weight, but also how the weight varies between categories, for example whether the mother is a smoker, etc.
+
+Let's look at scatter plots of the relationships between the variables and the relative correlation.
+
+```{r Generalized pairs plot, fig.height=7, fig.width=10, message=FALSE, warning=FALSE}
+
+ggpairs(data[,c("Weight","Gestation","N.pregnancies","Height","Cranium")],
+        title="Scatterplot Matrix of non categorical variables",
+        lower = list(continuous = 
+                       wrap("points",col="black",pch=21, fill = "coral2",alpha = 0.7)), 
+        diag = list(continuous = 
+                      wrap("densityDiag",fill="lightblue",  color = "black", alpha = 0.9)))+theme_bw()
+```
+
+Remember that our variable of interest is the weight, which is positively correlated with gestation, height and cranium; these 3 variables will probably be the ones that explain most of the variation in weight. At the moment there are no major possible multicollinearity problems, and further checks will be carried out later.
+
+For the rest of the variables we will use box plots to make any relationships/differences more effective.
+
+```{r Box plot weight by categorical variables, fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+
+box_plot_birth_type<-
+  ggbetweenstats( 
+      data = data,
+      x = Birth.type,
+      y = Weight,
+      type = "nonparametric"# for wilcoxon
+    )+
+  labs(title="Box plot Weight by Birth's type")+
+  ggplot2::scale_color_manual(values =c("darkred", "darkgreen"))
+
+
+box_plot_sex<-
+  ggbetweenstats( 
+      data = data,
+      x = Sex,
+      y = Weight,
+      type = "nonparametric"# for wilcoxon
+    )+
+  labs(title="Box plot Weight by Sex")+
+  ggplot2::scale_color_manual(values =c("#F8766D","#619CFF"))
+
+box_plot_hospital<-
+      ggbetweenstats( 
+      data = data,
+      x = Hospital,
+      y = Weight,
+      type = "nonparametric"# for wilcoxon
+    )+
+  labs(title="Box plot Weight by Hospital")+
+  ggplot2::scale_color_manual(values =c("#E495A5","#ABB065","#ACA4E2"))
+
+
+box_plot_smokers<-
+    ggbetweenstats( 
+      data = data,
+      x = Smokers,
+      y = Weight,
+      type = "nonparametric"# for wilcoxon
+    )+
+  labs(title="Box plot Weight by Smokers")+
+  ggplot2::scale_color_manual(values =c("azure2", "#405080"))
+
+box_plot_birth_type+box_plot_sex+box_plot_hospital+box_plot_smokers
+
+```
+
+Comments:
+
+- Birth's type: in this sample there appears to be no significant difference in weight between births with a cesarean section or natural birth.
+
+- Sex: as seen previously (shown only for completeness), there is a significant difference.
+
+- Hospitals: there is no significant differences in weight noted in hospitals.
+
+- Smokers: for smoking mothers the weight is lower, but the p-value, even if briefly, suggests that there are no significant differences, but as previously underlined it may simply indicate that the data collected are not robust enough to detect this difference.
+
+
+## 2) Multiple linear regression model
+
+
+We take an exploratory approach to our problem. We will base our choices on looking for a simple model, focusing on the relationship between variables rather than accurately predicting the results.
+
+Therefore, for the choice of our model we will use the Bayesian information criterion (BIC) which penalizes complex models more. We will look for a trade-off between adaptation and complexity.
+
+In this first model we will evaluate all the available variables and then we will look for the model that best explains the weights. So we are testing this hypothesis: is the dependent variable (weight) associated with the independent variables (all the other variables) studied at constant level of the other independent variables?
+With all the considerations made so far, we are going to build a model for predicting the weight of a newborn.
+
+```{r}
+model_all <- lm(Weight~., data=data)
+
+print_html(model_parameters(model_all, summary = TRUE))
+
+```
+
+```{r}
+model_performance(model_all)
+```
+
+First we notice an R2 adjusted of 0.728 (the higher the R2, the better the model explains the dependent variable, i.e. weight). As a rule of thumb, a R2>0.7 indicates a good fit of the model. 
+However, R2 alone does not indicate that it is potentially a good model, we must consider other criteria which we will see later.
+Now let's check which variables are not significant in explaining the variability of the weight (response variable).
+Let's analyze each variable step by step: first of all the intercept is not interpretable because we would find ourselves in a situation where a newborn of height 0 with gestation 0 would weight -6736g.
+
+We observe that:
+
+- Mother age: it is not significant when observing the p-value and it seems not significant in explaining the variability of weight in our sample.
+
+- Number of pregnancies: the number of pregnancies sustained appears to be significant in explaining the variability of weight, and for each pregnancy the mother had there is a small increase of approximately 11g.
+
+- Smokers: as regard this variable, it seems to indicate a decrease of 30g in the weight of the newborn compared non-smokers. However, in this first model it appears to be non significant. More considerations will be made later.
+
+- Gestation: for gestation we note an increase of 32.5g for each additional week of gestation.
+
+- Height and Cranium: for height and cranium size we have a significant and positive relationship with a gain of approximately 10g for every 1mm increased.
+
+- Type of birth: it seems to be significant, with an increase of 29.6g for natural births compared to those who had a cesarean section.
+
+- Hospital: it seems significant regarding hospital number 3 (osp3), with an increase of 28g compared to hospital  number 1 (osp1), but it is not significant regarding hospital number 2 (osp2) where there is a decrease of -11g compared to hospital number 1 (osp1).
+
+- Sex: as for sex there is an increase of 77g in males compared to females.
+
+
+## 3) Best model
+
+The precedent model is overly complex, and we need to consider the goal of our analysis.
+In explanatory modeling, we are primarily interested in understanding the important predictors, 
+and in making statements about the coefficients for these predictors.
+
+Let's start by removing the variables that are not significant in our model.
+
+```{r searching for a best model}
+model <- update(model_all,. ~ . -Mother.age - Hospital - Smokers)
+```
+
+```{r model summary}
+print_html(model_parameters(model, summary = TRUE))
+```
+
+```{r model performance}
+
+model_performance(model)
+```
+By eliminating those three variables we notice that the values remain almost the same, so it would be better to opt for this model.
+
+Given the nature of our study, we decided to remove the hospital variable.
+
+We also decided to remove the mother age variable, since it may be linked to the sociocultural context.
+
+The smokers variable is not significant for our sample. As already mentioned, it could be that this difference is not fully captured in the data collected. On the other hand, there are many studies in this regard that have shown that it has a negative impact on the fetus, so we opt to reintroduce it into the model, because in other cases it can generalize better, i.e. may work better outside of our sample.
+
+Looking at the model, we see that the type of birth is significant, but is it useful for our study type? Remember that we want to estimate the weight at birth, i.e. we need a model that predicts birth weight before the type of delivery is decided or known, then including it as a predictor would not be appropriate, as it is indeed an outcome of the pregnancy rather than a factor that would influence the birth weight from the start.
+
+```{r Final model}
+best_model <- update(model,. ~ .- Birth.type +Smokers)
+print_html(model_parameters(best_model, summary = TRUE))
+
+```
+
+For the moment these will be the variables that will compose our final model.
+
+
+## 4) Non-linear effects
+
+Once the model has been chosen, we explore the possible interaction effect between variables (categorical variable and continuous), because omitting some interactions between variables may lead to misleading conclusions.
+We will observe these interactions graphically and if the two lines are parallel there will be no interaction, while there will be if the lines are not parallel.
+
+```{r Variabile interactions by Sex, fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+
+p_inter_sex1<-
+  ggplot(data=data)+
+  geom_smooth(aes(y = Weight, x = N.pregnancies,col=Sex),method="lm",se=FALSE)+theme_bw()
+
+p_inter_sex2<-
+  ggplot(data=data)+
+  geom_smooth(aes(y = Weight, x = Gestation,col=Sex),method="lm",se=FALSE)+theme_bw()
+
+p_inter_sex3<-
+  ggplot(data=data)+
+  geom_smooth(aes(y = Weight, x = Height,col=Sex),method="lm",se=FALSE)+theme_bw()
+
+p_inter_sex4<-
+  ggplot(data=data)+
+  geom_smooth(aes(y = Weight, x = Cranium,col=Sex),method="lm",se=FALSE)+theme_bw()
+
+p_inter_sex1+p_inter_sex2+p_inter_sex3+p_inter_sex4
+
+```
+
+From the graphs there appears to be a potentially significant interaction with the variables N.pregnancies and Height. So we will opt to insert these interactions into the model to see if they are indeed significant.
+
+Now let's look at possible interactions with the Smokers variable.
+
+```{r Variabile interactions by Smokers, fig.height=10, fig.width=10, message=FALSE, warning=FALSE}
+
+p_inter_smokers1<-
+  ggplot(data=data)+
+  geom_smooth(aes(y = Weight, x = N.pregnancies,col=Smokers),method="lm",se=FALSE)+theme_bw()
+
+p_inter_smokers2<-
+  ggplot(data=data)+
+  geom_smooth(aes(y = Weight, x = Gestation,col=Smokers),method="lm",se=FALSE)+theme_bw()
+
+p_inter_smokers3<-
+  ggplot(data=data)+
+  geom_smooth(aes(y = Weight, x = Height,col=Smokers),method="lm",se=FALSE)+theme_bw()
+
+p_inter_smokers4<-
+  ggplot(data=data)+
+  geom_smooth(aes(y = Weight, x = Cranium,col=Smokers),method="lm",se=FALSE)+theme_bw()
+
+p_inter_smokers1+p_inter_smokers2+p_inter_smokers3+p_inter_smokers4
+
+```
+
+In this case, interactions seem to be possible for all the variables.
+
+Now, let's create a model with all the interactions we found to see which are significant and which are not.
+
+```{r model with all interaction}
+model_interaction <-lm((Weight) ~ N.pregnancies +Smokers + Gestation + Height + Sex + Cranium + 
+            Sex:Height+
+            Sex:N.pregnancies+
+            Smokers:Gestation+
+            Smokers:Height+
+            Smokers:Cranium+
+            Smokers:N.pregnancies,
+            data = data)
+
+print_html(model_parameters(model_interaction, summary = TRUE))
+
+```
+
+We observe that many of the interactions are not significant, so they will be removed and the model will be:
+
+```{r model with significant interaction}
+model_interaction2 <-lm((Weight) ~ N.pregnancies + Birth.type+Smokers+Gestation + Height + Sex + Cranium + 
+              Sex:Height+
+              Smokers:Gestation+
+              Smokers:Height,
+            data = data)
+
+print_html(model_parameters(model_interaction2, summary = TRUE))
+```
+
+Now let's compare the two models, the one with interactions and the one without.
+
+```{r comparison between models interaction and non}
+compare_performance(best_model,model_interaction2, metrics=c("BIC","RMSE","R2_adj"))
+```
+
+Observing the various metrics we do not notice a big improvement between the more complex model with interactions and the simpler one without them, therefore by observing the BIC values we opt to keep the simplest model without interactions. 
+
+Non-linear transformations will be handle next.
+
+
+## 5) Diagnostics
+
+Let's check the assumptions for a good model, which are summarized with LINE (Linearity, Independence, Normality and Equality of variance). If any of the conditions is not met, the tests and the conclusions could be erroneous.
+
+```{r Diagnostics model besto model, fig.height=10, fig.width=10}
+check_model(best_model)
+```
+
+Comments:
+
+- Posterior Predictive Checks: it appears to be respected, the observed data are quite in line with those predicted.
+
+- Linearity Assumption: there appears to be a deviation from the linearity condition. This may suggest to explore an alternative to linear regression.
+
+- Homogeneity of Variance: it seems not to be respected. This may be a problem since linear regression models assume that the model errors have constant variance. If this assumption is violated, the p-values from the model are no longer reliable.
+
+- Influential Observations: some borderline points near to 1 (value of Cook’s Distance) have been noted and will be analyzed in more detail later. Common rule of thumb is that an observation with a value of Cook’s Distance over 1 has too much influence.
+
+- Multicollinearity: there appears to be no multicollinearity problems.
+
+- Normality of Residuals: there seems to be a deviation from normality mostly at the tails, which indicates that the model doesn't predict the outcome well for that range, which shows larger deviations from the line.
+
+Let's also analytically check the test of normality of the residuals, test of homogeneity of variance and test for multicollinearity.
+
+```{r Diagnostics lm model tests}
+data %>%
+  reframe(
+      "Anderson Darling Test"=ad.test(residuals(best_model))[["p.value"]],
+      "Breusch Pagan Test"=lmtest::bptest(best_model)[["p.value"]],
+      "Durbin Watson Test"=lmtest::dwtest(best_model)[["p.value"]]
+  )
+```
+
+Summing up the graphs and tests (normality of the residuals and heteroskedasticity are present, but there is no autocorrelation) on the model, we are not in the condition to say that this is a good model, since the regression function is not linear and the error terms are not normal and have unequal variances. A solution to our problem could be to transform the predictor variable or the response variable or both.
+Additionally, the residuals are not normally distributed, although this by itself is not an issue due to the large sample size. For large sample sizes, the assumption of normality can be relaxed due to the central limit theorem.
+
+We opt to apply a transformation of the response variable and since the conditions allow it, we apply a Box Cox transformation which allows us to calculate a parameter (lambda) that determines how to transform the data to stabilize the variance and make the distribution as normal as possible.
+
+
+```{r Boxcox transformation best model besto1}
+
+bc <- boxcox(best_model, data=data)
+```
+
+```{r boxcox lamba}
+lambda <- bc$x[which.max(bc$y)]
+lambda
+```
+We obtain a lambda of 0.545, which we approximate to 0.5 to simplify the calculations.
+Now let's apply the formula to the response variable and we obtain:
+
+```{r Boxcox transformed model}
+
+model_bc <- lm(((Weight^0.5)-1)/0.5 ~ N.pregnancies+Gestation+Sex+Height+Cranium+Smokers,data=data)
+
+print_html(model_parameters(model_bc, summary = TRUE))
+```
+
+Let's look at the comparison between the two models.
+
+```{r Comparison of BoxCox and non models Performance, message=FALSE, warning=FALSE}
+
+compare_performance(model_bc,best_model,metrics=c("BIC","RMSE","R2_adj"))
+```
+We note improved R2 adjusted, RMSE and BIC cannot be commented because the data is on different scales. 
+
+Let's check how we change the diagnostics.
+
+```{r Diagnostics model model_bc, fig.height=10, fig.width=10}
+check_model(model_bc)
+```
+
+By applying the Box Cox transformation we notice an improvement in both the linearity and constant variants conditions (graphically).
+
+
+```{r Diagnostics boxcox model tests}
+data %>%
+  reframe(
+      "Anderson Darling Test"=ad.test(residuals(model_bc))[["p.value"]],
+      "Breusch Pagan Test"=lmtest::bptest(model_bc)[["p.value"]],
+      "Durbin Watson Test"=lmtest::dwtest(model_bc)[["p.value"]]
+      )
+```
+
+In the tests we get the same conclusions obtained previously. However, as already mentioned, the tests tend to reject the null hypothesis even for small deviations. To explore further we will analyze and identify any outliers and leverage points to see if and how they affect the quality of the model.
+
+
+### 5.1) Outliers
+
+Outliers are determined by the difference between observed values and predicted values, so the higher the difference the more the value should be analyzed further.
+
+```{r Standardized residual chart, fig.width=10}
+
+ols_plot_resid_stand(model_bc)
+```
+This graph tells us which values are considered outliers. All values that exceed the thresholds are approximated to -2,2 (the two red lines). The more a value goes outside the threshold values, the more it must be treated with caution.
+
+A leverage observation refers to how far an observation is compared to the average values of the independent variables of the dataset.
+
+Now let's see a graphic for outliers and/or observations with high leverage.
+
+```{r Studentized residuals vs leverage plot, fig.width=10}
+
+ols_plot_resid_lev(model_bc)
+```
+As could also be seen from the previous graph, the observation that immediately catches the eye is observation 1551, which has a high impact compared to the rest of the other observations.
+
+Now that we have seen the potential anomalous values graphically, let's identify these values.
+
+```{r Bonferroni Outlier Test}
+car::outlierTest(model_bc)
+```
+
+From the graphs we noticed the strong presence of leverage and outliers, but these 4 observations are the most influential. Are these lines incorrect data or special cases? Let's look in detail.
+
+```{r Outliers}
+outliers <- data[c(1551,155,1694,1399),]
+print_html(outliers)
+```
+
+First of all, we cannot just remove outliers without doing an analysis of the points in question. Among other things, doing so might lead to a good fit on the training data, but poor predictions on unseen data.
+
+Analyzing line 1551, which is the most influential, we notice a suspicious height compared to the weight and size of the cranium. However, we cannot say with certainty that it is an error, it could be a newborn with malformations or simply short. The same reasoning applies to the other observations.
+
+So the best way to deal is to do a sensitivity analysis. The basic idea behind a sensitivity analysis is to run a model multiple ways, i.e with and without those observations to see how it changes.
+
+```{r data without outliers, message=FALSE, warning=FALSE}
+
+data_No_outlair <- data[-c(1551,155,1694,1399),] #remove the outlier observations
+
+```
+
+Now let's take a step back and check the various diagnostics again.
+
+```{r lm model without outliers }
+model_no_outliers <- lm(Weight~N.pregnancies+Gestation+Sex+Height+Cranium,data=data_No_outlair)
+```
+
+```{r Diagnostics model_no_outliers,fig.height=10, fig.width=10}
+check_model(model_no_outliers)
+```
+
+By removing the outliers we notice that in the graphs the tails tend to be more distorted. This was caused by the outliers. In other words, they "pulled" the line towards themselves, distorting the coefficient estimate and influencing the interpretation of the model.
+
+Let's try to fix these problems as we did previously, by applying a Box Cox transformation.
+
+```{r Boxcox transformation model besto_no_outliers}
+
+bc_no_outliers <- boxcox(model_no_outliers,plotit=F, data=data_No_outlair)
+
+lambda_no_outliers <- bc_no_outliers$x[which.max(bc_no_outliers$y)]
+lambda_no_outliers 
+```
+Lambda is equal to 0.5, we use lambda transformation applied to the response variable to see the diagnostics improve.
+
+```{r Boxcox transformed model no outliers}
+model_bc_no_outliers <- lm(((Weight^0.5)-1)/0.5 ~
+                          N.pregnancies+Gestation+Sex+Height+Cranium+Smokers,data=data_No_outlair)
+
+print_html(model_parameters(model_bc_no_outliers, summary = TRUE))
+```
+
+
+```{r model_bc_no_outliers performance}
+
+model_performance(model_bc_no_outliers,metrics=c("BIC","RMSE","R2_adj"))
+```
+
+For the moment we immediately notice an improvement in the R2 adjusted . Let's check the diagnostics.
+
+```{r Diagnostics  model_bc_no_outliers, fig.height=8, fig.width=10}
+check_model(model_bc_no_outliers)
+```
+
+```{r Diagnostics boxcox model without outliers tests}
+data_No_outlair %>%
+  reframe(
+      "Anderson Darling Test"=ad.test(residuals(model_bc_no_outliers))[["p.value"]],
+      "Breusch Pagan Test"=lmtest::bptest(model_bc_no_outliers)[["p.value"]],
+      "Durbin Watson Test"=lmtest::dwtest(model_bc_no_outliers)[["p.value"]]
+  )
+```
+
+What we immediately notice is that the Breusch Pagan test suggests that we should not reject the hypothesis that model errors have constant variance. Furthermore, even graphically we can see that the problem of linearity and non-constant variance has been solved by applying a transformation to the response variable. Therefore all that remains is that the normality of the residuals deviates from the straight line, but given the large number of the sample we can accept it without making further considerations in this regard.
+
+
+## 6) Model and check predictions
+
+The conditions for applying linear regression have been met, so can the model be considered good for making predictions?
+
+Since we do not have another dataset to check how our model behaves with unseen data, we will use a Hold-Out method (as an alternative we could use a k-fold cross validation).
+
+```{r creation of tests and train data}
+set.seed(0)
+
+#create a random partitions of the data 80% and 20%.
+index <- createDataPartition(data_No_outlair$Weight, p = 0.80, list = FALSE)
+
+traindata <- data_No_outlair[index, ] #80% train
+testdata <- data_No_outlair[-index,] #20% test
+```
+
+
+Note all the steps, tests etc. have been omitted and only the final model is reported (results and conclusions on the various tests and diagnostics are the same as the model on the entire dataset).
+The model on the train data will result in:
+
+```{r model train}
+model_train <-lm(((Weight^0.5)-1)/0.5 ~ 
+                  N.pregnancies+Gestation+Sex+Height+Cranium+Smokers,data=traindata)
+```
+
+Now let's calculate the residuals (remember that they are calculated by subtracting the real values with those predicted by the model) and RMSE in the train data, then we do the same thing again but using the train model on the test dataset.
+
+```{r Hold out}
+
+#test data 
+traindata$predicted <- predict(model_train,traindata)
+traindata$residuals <- (((traindata$Weight)^0.5)-1)/0.5 - traindata$predicted
+
+RMSE_train <- sqrt(mean(traindata$residuals ** 2))
+
+#train data
+testdata$predicted <- predict(model_train, testdata)
+testdata$residuals <- (((testdata$Weight)^0.5)-1)/0.5 - testdata$predicted
+
+RMSE_test <- sqrt(mean(testdata$residuals ** 2)) 
+
+
+tibble("RMSE train"= RMSE_train, "RMSE test"=RMSE_test)
+
+```
+Here we have the case where the difference between the two RMSE is not high and therefore the model is considered good for making predictions, because we are not in a situation of overfitting or underfitting.
+
+## 7) Predictions
+
+Prediction for the weight of a newborn baby, considering that the mother is in her third pregnancy and will give birth at the 39th week (median values were used for the other unknown parameters).
+
+```{r Predictions, message=FALSE, warning=FALSE}
+
+#since we have carried out a box cox transformation we must transform back to the original scale to make it understandable
+
+back_transformation <- function(x){
+  return(((x * 0.5) + 1) ** (1/0.5))
+}
+
+
+predictions(model_bc_no_outliers,transform=back_transformation,
+            newdata = datagrid(
+              Gestation=39,N.pregnancies=2,Sex="F",Smokers=c("Yes","No")))
+
+```
+Estimates are around 3244g and slightly lower estimates for a smoking mother. Considering that central values were used for height and cranium size, the values obtained reflect the weight very well for a healthy newborn with those characteristics mentioned before.
+
+
+## 8) Graphical representations of the model
+
+Let's plot the observed and predicted values, in order to visualize the discrepancies between the two values.
+
+```{r Predicted vs actual values, fig.height=7, fig.width=10}
+
+ggplot(data=data_No_outlair,
+       aes(y = Weight, 
+           x= back_transformation(predict(model_bc_no_outliers, data_No_outlair)))) +
+  geom_point() +
+  geom_abline(intercept=0, slope=1,col=2)+ # estimated regression line 
+  labs(title="Predicted vs actual values",x="Predicted Weight")+theme_bw()
+```
+Because each data point is close to the regression line, we conclude that this model fits the data well.
+
+Since we have multiple predictor variables, the best way to observe the relationship between predictor variable and the response variable is to plot the response and each predictor individually while holding other predictor variables constant.
+
+```{r plot of individual predictor and response, fig.height=7, fig.width=10}
+avPlots(model_bc_no_outliers)
+```
+
+
+
+
+
